@@ -26,16 +26,29 @@ impl<const N: usize> Hh<N> {
 
 impl<const N: usize> From<f32> for Hh<N> {
     fn from(decay: f32) -> Self {
-        let mut context = crate::AudioContextBuilder::<N>::new().channels(2).build();
+        Self::with_sample_rate(decay, 44100)
+    }
+}
+
+impl<const N: usize> Hh<N> {
+    pub fn with_sample_rate(decay: f32, sr: usize) -> Self {
+        let mut context = crate::AudioContextBuilder::<N>::new()
+            .sr(sr)
+            .channels(2)
+            .build();
         let input = context.add_mono_node(Pass {});
 
         let source = context.add_mono_node(Noise::new(42));
-        let filter = context.add_mono_node(ResonantHighPassFilter::new().cutoff(15000.));
+        let filter = context.add_mono_node(
+            ResonantHighPassFilter::new()
+                .sr(sr)
+                .cutoff((sr as f32 * 0.34).min(15000.)),
+        );
         let amp = context.add_stereo_node(Mul::new(0.));
 
         context.chain(vec![source, filter, amp, context.destination]);
 
-        let env_amp = context.add_mono_node(EnvPerc::new().attack(0.003).decay(decay));
+        let env_amp = context.add_mono_node(EnvPerc::new().sr(sr).attack(0.003).decay(decay));
         context.tags.insert("d", env_amp);
         context.chain(vec![input, env_amp, amp]);
 
@@ -63,6 +76,7 @@ impl<const N: usize> Node<N> for Hh<N> {
             Message::SetToNumber(0, value) => self.context.graph[self.context.tags["d"]]
                 .node
                 .send_msg(Message::SetToNumber(1, value)),
+            Message::ResetOrder => self.input_order.clear(),
             Message::Index(i) => self.input_order.push(i),
             Message::IndexOrder(pos, index) => self.input_order.insert(pos, index),
             _ => {}

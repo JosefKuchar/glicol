@@ -33,14 +33,23 @@ impl<const N: usize> Bd<N> {
 
 impl<const N: usize> From<f32> for Bd<N> {
     fn from(decay: f32) -> Self {
-        let mut context = crate::AudioContextBuilder::<N>::new().channels(2).build();
+        Self::with_sample_rate(decay, 44100)
+    }
+}
+
+impl<const N: usize> Bd<N> {
+    pub fn with_sample_rate(decay: f32, sr: usize) -> Self {
+        let mut context = crate::AudioContextBuilder::<N>::new()
+            .sr(sr)
+            .channels(2)
+            .build();
         let input = context.add_mono_node(Pass {});
-        let env_amp = context.add_mono_node(EnvPerc::new().attack(0.003).decay(decay));
+        let env_amp = context.add_mono_node(EnvPerc::new().sr(sr).attack(0.003).decay(decay));
         context.tags.insert("d", env_amp);
-        let env_pitch = context.add_mono_node(EnvPerc::new().attack(0.01).decay(0.1));
+        let env_pitch = context.add_mono_node(EnvPerc::new().sr(sr).attack(0.01).decay(0.1));
         let mul = context.add_stereo_node(Mul::new(50.));
         let add = context.add_stereo_node(Add::new(60.));
-        let sin = context.add_mono_node(SinOsc::new());
+        let sin = context.add_mono_node(SinOsc::new().sr(sr));
         let sin_amp = context.add_mono_node(Mul::new(0.));
         context.chain(vec![sin, sin_amp, context.destination]);
         context.chain(vec![input, env_amp, sin_amp]);
@@ -70,6 +79,7 @@ impl<const N: usize> Node<N> for Bd<N> {
             Message::SetToNumber(0, value) => self.context.graph[self.context.tags["d"]]
                 .node
                 .send_msg(Message::SetToNumber(1, value)),
+            Message::ResetOrder => self.input_order.clear(),
             Message::Index(i) => self.input_order.push(i),
             Message::IndexOrder(pos, index) => self.input_order.insert(pos, index),
             _ => {}

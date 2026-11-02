@@ -42,10 +42,8 @@ impl<const N: usize> Node<N> for SinOsc {
                     for buf in output.iter_mut() {
                         buf[i] = (self.phase * 2.0 * std::f32::consts::PI).sin();
                     }
-                    self.phase += self.freq / self.sr as f32;
-                    if self.phase > 1.0 {
-                        self.phase -= 1.0
-                    }
+                    self.phase =
+                        (self.phase + super::phase_step(self.freq, self.sr)).rem_euclid(1.0);
                 }
             }
             1 => {
@@ -59,10 +57,8 @@ impl<const N: usize> Node<N> for SinOsc {
                         buf[i] = (self.phase * 2.0 * std::f32::consts::PI).sin();
                     }
 
-                    self.phase += mod_buf / self.sr as f32;
-                    if self.phase > 1.0 {
-                        self.phase -= 1.0
-                    }
+                    self.phase =
+                        (self.phase + super::phase_step(*mod_buf, self.sr)).rem_euclid(1.0);
                 }
             }
             _ => (),

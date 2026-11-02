@@ -86,7 +86,17 @@ impl Points {
             })
             .collect::<Vec<_>>();
 
-        if point_list[0].0 != 0 {
+        point_list.sort_by_key(|p| p.0);
+        // Last value wins when timestamps quantize to the same sample.
+        let mut normalized: Vec<(usize, f32)> = Vec::new();
+        for point in point_list {
+            if normalized.last().is_some_and(|p| p.0 == point.0) {
+                normalized.pop();
+            }
+            normalized.push(point);
+        }
+        let mut point_list = normalized;
+        if point_list.first().is_some_and(|p| p.0 != 0) {
             point_list.insert(0, (0, 0.0));
         }
 
@@ -96,62 +106,37 @@ impl Points {
 
 impl<const N: usize> Node<N> for Points {
     fn process(&mut self, _inputs: &mut HashMap<usize, Input<N>>, output: &mut [Buffer<N>]) {
-        // println!("span {}", self.span);
-        let list_len = self.point_list.len();
-        if list_len == 0 {
-            return;
-        }
-        let cycle_dur = 60. / self.bpm * 4.;
-        let bar_dur = (cycle_dur * self.span * self.sr as f32) as usize;
-
-        if !self.is_looping {
-            for out in &mut *output[0] {
-                let pos = self.step;
-                let samples = &self.point_list;
-
-                let index = samples.iter().position(|s| pos <= s.0).map_or(0, |p| p - 1);
-
-                // println!("index {} pos {} samples {:?}", index, pos, samples);
-                if index < samples.len() - 1 {
-                    // not yet reach the last point
-                    let (prev_pos, prev_val) = samples[index];
-                    let (next_pos, next_val) = samples[index + 1];
-                    let t = (pos as f32 - prev_pos as f32) / (next_pos as f32 - prev_pos as f32);
-                    *out = prev_val + t * (next_val - prev_val);
+        let period = (240.0 / self.bpm * self.span * self.sr as f32).max(1.0) as usize;
+        for i in 0..N {
+            let pos = if self.is_looping {
+                self.step % period
+            } else {
+                self.step
+            };
+            let end = self.point_list.partition_point(|p| p.0 <= pos);
+            let value = if self.point_list.is_empty() {
+                0.0
+            } else if end == 0 {
+                self.point_list[0].1
+            } else if end < self.point_list.len() {
+                let (a, x) = self.point_list[end - 1];
+                let (b, y) = self.point_list[end];
+                x + (y - x) * (pos - a) as f32 / (b - a) as f32
+            } else {
+                let (a, x) = self.point_list[end - 1];
+                if self.is_looping && a < period {
+                    x + (self.point_list[0].1 - x) * (pos - a) as f32 / (period - a) as f32
                 } else {
-                    // reach the last point
-                    // pass the last point stay at the last point
-                    // panic!("self.step {}", self.step);
-                    *out = samples.last().unwrap().1;
+                    x
                 }
-                self.step += 1;
+            };
+            for channel in output.iter_mut() {
+                channel[i] = value;
             }
-        } else {
-            for out in &mut *output[0] {
-                let pos = self.step % bar_dur;
-                let period = bar_dur;
-                let samples = &self.point_list;
-
-                let prev = samples.iter().enumerate().find(|(_, (s, _))| pos <= *s);
-
-                let is_last = prev.is_none();
-                let (index, (prev_pos, prev_val)) =
-                    prev.unwrap_or_else(|| (samples.len() - 1, samples.last().unwrap()));
-
-                let (next_pos, next_val) = samples[(index + 1) % samples.len()];
-
-                let t = if is_last {
-                    (pos as f32 - *prev_pos as f32)
-                        / (period as f32 - *prev_pos as f32 + next_pos as f32)
-                } else {
-                    (pos as f32 - *prev_pos as f32) / (next_pos as f32 - *prev_pos as f32)
-                };
-                *out = prev_val + t * (next_val - prev_val);
-
-                self.step += 1;
-            }
+            self.step += 1;
         }
     }
+
     fn send_msg(&mut self, info: Message) {
         match info {
             Message::SetParam(0, GlicolPara::Points(time_list)) => {

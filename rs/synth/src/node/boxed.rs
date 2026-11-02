@@ -72,6 +72,9 @@ impl<const N: usize> Node<N> for BoxedNode<N> {
     fn send_msg(&mut self, info: Message) {
         self.0.send_msg(info)
     }
+    fn take_error(&mut self) -> Option<String> {
+        self.0.take_error()
+    }
 }
 
 impl<const N: usize> Node<N> for BoxedNodeSend<N> {
@@ -80,6 +83,9 @@ impl<const N: usize> Node<N> for BoxedNodeSend<N> {
     }
     fn send_msg(&mut self, info: Message) {
         self.0.send_msg(info)
+    }
+    fn take_error(&mut self) -> Option<String> {
+        self.0.take_error()
     }
 }
 

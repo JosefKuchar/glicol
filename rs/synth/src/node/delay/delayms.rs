@@ -27,8 +27,8 @@ impl DelayMs {
     }
 
     pub fn delay(self, delay: f32, chan: u8) -> Self {
-        let delay_n = ((delay / 1000. * self.sr as f32) as usize).max(1);
-        let buf = vec![Fixed::from(vec![0.0; delay_n]); chan as usize];
+        let delay_n = (delay / 1000. * self.sr as f32) as usize;
+        let buf = vec![Fixed::from(vec![0.0; delay_n.max(1)]); chan as usize];
 
         Self {
             buf,
@@ -49,18 +49,25 @@ impl<const N: usize> Node<N> for DelayMs {
             return;
         }
 
+        let output_channels = output.len();
         match inputs.len() {
             1 => {
                 // no modulation
                 match self.delay_n {
                     // equal to a pass node
-                    0 => output[0].copy_from_slice(&main_input.buffers()[0]),
+                    0 => {
+                        for (c, out) in output.iter_mut().enumerate() {
+                            out.copy_from_slice(
+                                &main_input.buffers()[c.min(main_input.buffers().len() - 1)],
+                            );
+                        }
+                    }
                     _ => {
-                        let iter = self
-                            .buf
-                            .iter_mut()
-                            .zip(output.iter_mut())
-                            .zip(main_input.buffers());
+                        let iter = self.buf.iter_mut().zip(output.iter_mut()).zip(
+                            (0..output_channels).map(|c| {
+                                &main_input.buffers()[c.min(main_input.buffers().len() - 1)]
+                            }),
+                        );
 
                         for ((fixed, out_buf), main_buf) in iter {
                             for (out, main) in out_buf.iter_mut().zip(main_buf.iter()) {
@@ -76,22 +83,27 @@ impl<const N: usize> Node<N> for DelayMs {
 
                 let mod_buf = &mut ref_input.buffers();
                 for i in 0..N {
-                    let mut pos = -mod_buf[0][i] / 1000. * self.sr as f32;
-                    while pos < 0. {
-                        pos += self.buf[0].len() as f32;
-                    }
+                    let delay = if mod_buf[0][i].is_finite() {
+                        mod_buf[0][i].clamp(
+                            1.0 / self.sr.max(1) as f32 * 1000.0,
+                            self.buf[0].len() as f32 / self.sr.max(1) as f32 * 1000.0,
+                        )
+                    } else {
+                        1.0
+                    };
+                    let pos =
+                        (-delay / 1000. * self.sr as f32).rem_euclid(self.buf[0].len() as f32);
                     let pos_int = pos.floor() as usize;
                     let pos_frac = pos.fract();
 
-                    let iter = self
-                        .buf
-                        .iter_mut()
-                        .zip(output.iter_mut())
-                        .zip(main_input.buffers());
+                    let iter = self.buf.iter_mut().zip(output.iter_mut()).zip(
+                        (0..output_channels)
+                            .map(|c| &main_input.buffers()[c.min(main_input.buffers().len() - 1)]),
+                    );
 
                     for ((fixed, out_buf), main_buf) in iter {
-                        out_buf[i] = fixed.get(pos_int) * pos_frac
-                            + fixed.get(pos_int + 1) * (1. - pos_frac);
+                        out_buf[i] = fixed.get(pos_int) * (1. - pos_frac)
+                            + fixed.get((pos_int + 1) % fixed.len()) * pos_frac;
                         fixed.push(main_buf[i]);
                     }
                 }
@@ -111,7 +123,7 @@ impl<const N: usize> Node<N> for DelayMs {
                 self.delay_n = delay_n;
 
                 if delay_n == 0 {
-                    self.buf.clear();
+                    self.buf = vec![Fixed::from(vec![0.0]); self.buf.len()];
                 } else {
                     let chan = self.buf.len();
                     self.buf = vec![Fixed::from(vec![0.0; delay_n]); chan];

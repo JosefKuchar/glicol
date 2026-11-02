@@ -41,3 +41,30 @@ fn process_oscillation<const N: usize>(
         _ => {}
     }
 }
+
+/// Polynomial BLEP correction for a unit-phase discontinuity.
+pub(crate) fn poly_blep(t: f32, dt: f32) -> f32 {
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    if t < dt {
+        let x = t / dt;
+        x + x - x * x - 1.0
+    } else if t > 1.0 - dt {
+        let x = (t - 1.0) / dt;
+        x * x + x + x + 1.0
+    } else {
+        0.0
+    }
+}
+pub(crate) fn phase_step(freq: f32, sr: usize) -> f32 {
+    if freq.is_finite() {
+        (freq / sr.max(1) as f32).clamp(-0.499, 0.499)
+    } else {
+        0.0
+    }
+}
+mod pulse;
+pub use pulse::PulseOsc;
+mod wavetable;
+pub use wavetable::{WavetableBank, WavetableOsc};

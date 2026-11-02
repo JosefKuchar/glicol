@@ -10,6 +10,7 @@ pub struct Meta<const N: usize> {
     scope: Scope<'static>,
     engine: Engine,
     input_order: Vec<usize>,
+    error: Option<String>,
 }
 
 impl<const N: usize> Default for Meta<N> {
@@ -70,6 +71,7 @@ impl<const N: usize> Meta<N> {
 
         let mut engine = Engine::new();
         engine.set_optimization_level(OptimizationLevel::Full);
+        engine.set_max_operations(100_000);
         let ast = engine.compile("").unwrap();
 
         Self {
@@ -80,6 +82,7 @@ impl<const N: usize> Meta<N> {
             ast,
             // phase,
             input_order: Vec::new(),
+            error: None,
         }
     }
 
@@ -87,16 +90,31 @@ impl<const N: usize> Meta<N> {
         Self { sr, ..self }
     }
 
+    pub fn try_code(mut self, code: &str) -> Result<Self, String> {
+        self.ast = self.engine.compile(code).map_err(|e| e.to_string())?;
+        self.error = None;
+        Ok(self)
+    }
     pub fn code(mut self, code: &str) -> Self {
-        if let Ok(a) = self.engine.compile(code) {
-            self.ast = a;
-        };
+        match self.engine.compile(code) {
+            Ok(ast) => {
+                self.ast = ast;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
         self
     }
 }
 
 impl<const N: usize> Node<N> for Meta<N> {
     fn process(&mut self, inputs: &mut HashMap<usize, Input<N>>, output: &mut [Buffer<N>]) {
+        for out in output.iter_mut() {
+            out.fill(0.0);
+        }
+        if self.error.is_some() {
+            return;
+        }
         if !inputs.is_empty() {
             let arr: Array = inputs[&self.input_order[0]].buffers()[0]
                 .iter()
@@ -112,26 +130,41 @@ impl<const N: usize> Node<N> for Meta<N> {
             .eval_ast_with_scope::<Array>(&mut self.scope, &self.ast)
         {
             Ok(result) => {
-                for (out, res) in output[0].iter_mut().zip(result.iter()) {
-                    if let Ok(v) = res.as_float() {
-                        *out = v;
-                    };
+                if result.len() != N {
+                    self.error = Some(format!(
+                        "meta returned {} samples; expected {N}",
+                        result.len()
+                    ));
+                    return;
+                }
+                for (i, res) in result.iter().enumerate() {
+                    match res.as_float() {
+                        Ok(v) if v.is_finite() => {
+                            for out in output.iter_mut() {
+                                out[i] = v;
+                            }
+                        }
+                        _ => {
+                            self.error = Some("meta output must contain finite floats".into());
+                            return;
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                // TODO What do we do with this Box<EvalAltResult>?
-                _ = e;
-            }
+            Err(e) => self.error = Some(e.to_string()),
         }
+
         // self.phase += N;
     }
     fn send_msg(&mut self, info: Message) {
         match info {
-            Message::SetToSymbol(0, s) => {
-                if let Ok(a) = self.engine.compile(s) {
-                    self.ast = a;
+            Message::SetToSymbol(0, s) => match self.engine.compile(s) {
+                Ok(ast) => {
+                    self.ast = ast;
+                    self.error = None;
                 }
-            }
+                Err(e) => self.error = Some(e.to_string()),
+            },
             Message::Index(i) => self.input_order.push(i),
             Message::IndexOrder(pos, index) => self.input_order.insert(pos, index),
             Message::ResetOrder => {
@@ -139,6 +172,10 @@ impl<const N: usize> Node<N> for Meta<N> {
             }
             _ => {}
         }
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 
     fn to_boxed_nodedata(mut self, channels: usize) -> NodeData<BoxedNodeSend<N>, N> {

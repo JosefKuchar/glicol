@@ -16,6 +16,7 @@ pub struct MsgSynth {
     sr: usize,
     step: usize,
     input_order: Vec<usize>,
+    error: Option<String>,
 }
 
 impl Default for MsgSynth {
@@ -34,6 +35,7 @@ impl MsgSynth {
             dec: 0.1,
             ref_order: HashMap::new(),
             input_order: Vec::new(),
+            error: None,
             // period_in_cycle: 1.0,
             // cycle_dur: 2.0,
             sr: 44100,
@@ -106,14 +108,14 @@ impl<const N: usize> Node<N> for MsgSynth {
                     let pos = self.step - synth_info.0;
 
                     let amp = match pos.cmp(&attack_n) {
-                        Ordering::Greater | Ordering::Equal => {
+                        Ordering::Less | Ordering::Equal => {
                             if attack_n == 0 {
                                 0.0
                             } else {
                                 pos as f32 / (self.att * self.sr as f32)
                             }
                         }
-                        Ordering::Less => {
+                        Ordering::Greater => {
                             if decay_n == 0 {
                                 0.0
                             } else {
@@ -142,6 +144,9 @@ impl<const N: usize> Node<N> for MsgSynth {
             self.step += 1;
         }
     }
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
     fn send_msg(&mut self, info: Message) {
         match info {
             Message::SetToNumber(pos, v) => match pos {
@@ -160,13 +165,26 @@ impl<const N: usize> Node<N> for MsgSynth {
                             s.chars().filter(|c| !c.is_whitespace()).collect::<_>();
                         // estimate event_s "2.74343=>60"
                         // for event_s.split("=>");
-                        if event_s.contains("=>") {
-                            let mut events = event_s.split("=>").map(|v| v.parse::<f32>().unwrap());
-
-                            if let (Some(start), Some(end)) = (events.next(), events.next()) {
-                                let event_n = (start * self.sr as f32) as usize;
-                                self.events.push((event_n, end));
+                        match event_s.split_once("=>") {
+                            Some((time, pitch)) => {
+                                match (time.parse::<f64>(), pitch.parse::<f32>()) {
+                                    (Ok(time), Ok(pitch))
+                                        if time.is_finite()
+                                            && time >= 0.
+                                            && time <= 86400.
+                                            && pitch.is_finite()
+                                            && (0.0..=127.).contains(&pitch) =>
+                                    {
+                                        self.events
+                                            .push(((time * self.sr as f64).round() as usize, pitch))
+                                    }
+                                    _ => {
+                                        self.error =
+                                            Some("invalid msgsynth timestamp or pitch".into())
+                                    }
+                                }
                             }
+                            None => self.error = Some("msgsynth expects seconds=>MIDI".into()),
                         }
                     }
                     _ => {}

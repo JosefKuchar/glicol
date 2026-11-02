@@ -1,3 +1,5 @@
+For the synthesis extensions, checked offline renderer, examples and validation in this fork, see [SYNTHESIS.md](SYNTHESIS.md).
+
 <div align="center">
   <br />
   <p>

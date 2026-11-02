@@ -25,15 +25,21 @@ pub struct SawSynth<const N: usize> {
 
 impl<const N: usize> SawSynth<N> {
     pub fn new(attack: f32, decay: f32) -> Self {
-        let mut context = crate::AudioContextBuilder::<N>::new().channels(2).build();
+        Self::with_sample_rate(attack, decay, 44100)
+    }
+    pub fn with_sample_rate(attack: f32, decay: f32, sr: usize) -> Self {
+        let mut context = crate::AudioContextBuilder::<N>::new()
+            .sr(sr)
+            .channels(2)
+            .build();
         let input = context.add_mono_node(Pass {});
 
-        let source = context.add_mono_node(SawOsc::new());
+        let source = context.add_mono_node(SawOsc::new().sr(sr));
         let amp = context.add_stereo_node(Mul::new(0.));
 
         context.chain(vec![source, amp, context.destination]);
 
-        let env_amp = context.add_mono_node(EnvPerc::new().attack(attack).decay(decay));
+        let env_amp = context.add_mono_node(EnvPerc::new().sr(sr).attack(attack).decay(decay));
         context.tags.insert("env_amp", env_amp);
         context.chain(vec![input, env_amp, amp]);
 
@@ -70,6 +76,7 @@ impl<const N: usize> Node<N> for SawSynth<N> {
                     .send_msg(Message::SetToNumber(1, value)),
                 _ => {}
             },
+            Message::ResetOrder => self.input_order.clear(),
             Message::Index(i) => self.input_order.push(i),
             Message::IndexOrder(pos, index) => self.input_order.insert(pos, index),
             _ => {}

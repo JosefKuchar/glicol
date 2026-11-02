@@ -47,11 +47,10 @@ impl<const N: usize> Node<N> for SawOsc {
             self.freq,
             &mut self.inc,
             |out, freq| {
-                *out = self.phase * 2. - 1.;
-                self.phase += freq / self.sr as f32;
-                if self.phase > 1. {
-                    self.phase -= 1.
-                }
+                let step = super::phase_step(freq, self.sr);
+                self.phase = self.phase.rem_euclid(1.0);
+                *out = self.phase * 2.0 - 1.0 - super::poly_blep(self.phase, step.abs());
+                self.phase = (self.phase + step).rem_euclid(1.0);
             },
         );
     }

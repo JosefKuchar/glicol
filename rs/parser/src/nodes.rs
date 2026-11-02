@@ -52,6 +52,9 @@ where
 
 #[derive(PartialEq, Debug)]
 pub enum Component<'ast> {
+    Pulse(Pulse<'ast>),
+    Wavetable(Wavetable<'ast>),
+    Gate(Gate),
     Points(Points),
     Delayn(Delayn<'ast>),
     Delayms(Delayms<'ast>),
@@ -99,6 +102,24 @@ pub enum Component<'ast> {
 impl<'ast> Component<'ast> {
     pub fn all_references<'a>(&'a self) -> Vec<&'ast str> {
         match self {
+            Self::Pulse(Pulse { frequency, width }) => [frequency, width]
+                .into_iter()
+                .filter_map(|p| match p {
+                    NumberOrRef::Ref(r) => Some(*r),
+                    _ => None,
+                })
+                .collect(),
+            Self::Wavetable(Wavetable {
+                frequency,
+                position,
+                ..
+            }) => [frequency, position]
+                .into_iter()
+                .filter_map(|p| match p {
+                    NumberOrRef::Ref(r) => Some(*r),
+                    _ => None,
+                })
+                .collect(),
             Self::Delayn(Delayn {
                 param: UsizeOrRef::Ref(r),
             })
@@ -205,7 +226,7 @@ impl Node<'_> for Points {
         pairs: &mut Pairs<'_, Rule>,
         span: Span<'_>,
     ) -> Result<Self, Box<Error<Rule>>> {
-        let mut node_span = -1.0;
+        let mut node_span = 1.0;
         let mut is_looping = false;
         let points = pairs.next().ok_or_else(|| {
             span.as_end_span()
@@ -1107,13 +1128,72 @@ impl<'ast> Node<'ast> for CodeBlock<'ast> {
         pairs: &mut Pairs<'ast, Rule>,
         span: Span<'ast>,
     ) -> Result<Self, Box<Error<Rule>>> {
-        let s = pairs
+        let pair = pairs
             .next()
-            .ok_or_else(|| span.as_end_span().to_err_with_positives([Rule::code]))?
-            .as_str();
+            .ok_or_else(|| span.as_end_span().to_err_with_positives([Rule::code]))?;
+        let s = pair.as_str();
+        let code = if pair.as_rule() == Rule::eval_content {
+            s
+        } else {
+            s.strip_prefix('`')
+                .and_then(|s| s.strip_suffix('`'))
+                .ok_or_else(|| span.as_end_span().to_err_with_positives([Rule::code]))?
+        };
+        Ok(Self { code })
+    }
+}
 
+#[derive(PartialEq, Debug)]
+pub struct Pulse<'a> {
+    pub frequency: NumberOrRef<&'a str>,
+    pub width: NumberOrRef<&'a str>,
+}
+impl<'a> Node<'a> for Pulse<'a> {
+    fn parse_from_iter(
+        pairs: &mut Pairs<'a, Rule>,
+        span: Span<'a>,
+    ) -> Result<Self, Box<Error<Rule>>> {
         Ok(Self {
-            code: &s[1..s.len() - 1],
+            frequency: NumberOrRef::parse_from_iter(pairs, span)?,
+            width: NumberOrRef::parse_from_iter(pairs, span)?,
+        })
+    }
+}
+#[derive(PartialEq, Debug)]
+pub struct Wavetable<'a> {
+    pub bank: &'a str,
+    pub frequency: NumberOrRef<&'a str>,
+    pub position: NumberOrRef<&'a str>,
+}
+impl<'a> Node<'a> for Wavetable<'a> {
+    fn parse_from_iter(
+        pairs: &mut Pairs<'a, Rule>,
+        span: Span<'a>,
+    ) -> Result<Self, Box<Error<Rule>>> {
+        let bank = pairs
+            .next()
+            .ok_or_else(|| span.as_end_span().to_err_with_positives([Rule::symbol]))?
+            .as_str();
+        Ok(Self {
+            bank,
+            frequency: NumberOrRef::parse_from_iter(pairs, span)?,
+            position: NumberOrRef::parse_from_iter(pairs, span)?,
+        })
+    }
+}
+#[derive(PartialEq, Debug)]
+pub struct Gate {
+    pub onset: f32,
+    pub duration: f32,
+}
+impl Node<'_> for Gate {
+    fn parse_from_iter(
+        pairs: &mut Pairs<'_, Rule>,
+        span: Span<'_>,
+    ) -> Result<Self, Box<Error<Rule>>> {
+        Ok(Self {
+            onset: pairs.next_parsed(span)?,
+            duration: pairs.next_parsed(span)?,
         })
     }
 }

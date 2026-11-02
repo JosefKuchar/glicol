@@ -1,3 +1,7 @@
+pub mod offline;
+use glicol_synth::oscillator::WavetableBank;
+pub use offline::{NoteEvent, OfflineRenderer};
+use std::sync::{Arc, OnceLock};
 // todo: When error, the error info still updates some nodes..
 
 pub mod util;
@@ -45,6 +49,8 @@ pub struct Engine<const N: usize> {
     clock: usize,
     pub livecoding: bool,
     need_update: bool,
+    render_error: Option<String>,
+    wave_tables: HashMap<String, Arc<WavetableBank>>,
 }
 
 impl<const N: usize> Default for Engine<N> {
@@ -58,8 +64,17 @@ impl<const N: usize> Engine<N> {
         let mut context = AudioContext::<N>::new(AudioContextConfig::default());
         let mut index_info = HashMap::new();
         index_info.insert("~input".to_string(), vec![context.add_stereo_node(Pass {})]);
+        static BASIC: OnceLock<Arc<WavetableBank>> = OnceLock::new();
+        let mut wave_tables = HashMap::new();
+        wave_tables.insert(
+            "basic".into(),
+            BASIC
+                .get_or_init(|| Arc::new(WavetableBank::basic()))
+                .clone(),
+        );
         Self {
             context,
+            wave_tables,
             ast: None,
             index_info: index_info.clone(),
             index_info_backup: index_info.clone(),
@@ -72,35 +87,53 @@ impl<const N: usize> Engine<N> {
             clock: 0,
             livecoding: true,
             need_update: false,
+            render_error: None,
         }
     }
 
+    /// Compatibility entry point; checked rendering reports any failed message.
     pub fn send_msg(&mut self, msg: &str) {
-        let commands: String = msg.chars().filter(|c| !c.is_whitespace()).collect::<_>();
-        for command in commands.split(';').filter(|c| !c.is_empty()) {
-            let mut list = command.split(',');
-            let (Some(chain_name), Some(chain_pos), Some(param_pos), Some(value)) =
-                (list.next(), list.next(), list.next(), list.next())
-            else {
-                continue; // todo: this should be an error
-            };
+        if let Err(e) = self.try_send_msg(msg) {
+            self.render_error = Some(e.to_string());
+        }
+    }
 
-            let chain_pos = chain_pos.parse::<usize>().unwrap_or_default();
-            let param_pos = param_pos.parse::<u8>().unwrap_or_default();
-            if self.index_info.contains_key(chain_name) {
-                match value.parse::<f32>() {
-                    // todo: check the name and pos
-                    Ok(v) => self.context.graph[self.index_info[chain_name][chain_pos]]
-                        .node
-                        .send_msg(Message::SetToNumber(param_pos, v)),
-                    Err(_) => {
-                        self.context.graph[self.index_info[chain_name][chain_pos]]
-                            .node
-                            .send_msg(Message::SetToSymbol(param_pos, value.to_string()));
-                    }
-                };
+    pub fn try_send_msg(&mut self, msg: &str) -> Result<(), EngineError> {
+        let mut commands = Vec::new();
+        for command in msg.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+            let parts = command.split(',').map(str::trim).collect::<Vec<_>>();
+            if parts.len() != 4 {
+                return Err(EngineError::InvalidMessage(command.into()));
+            }
+            let pos = parts[1]
+                .parse::<usize>()
+                .map_err(|_| EngineError::InvalidMessage(command.into()))?;
+            let param = parts[2]
+                .parse::<u8>()
+                .map_err(|_| EngineError::InvalidMessage(command.into()))?;
+            let id = self
+                .index_info
+                .get(parts[0])
+                .and_then(|chain| chain.get(pos))
+                .copied()
+                .ok_or_else(|| {
+                    EngineError::InvalidMessage(format!("unknown node {},{pos}", parts[0]))
+                })?;
+            let value = match parts[3].parse::<f32>() {
+                Ok(v) if v.is_finite() => Message::SetToNumber(param, v),
+                Ok(_) => return Err(EngineError::InvalidMessage("nonfinite value".into())),
+                Err(_) => Message::SetToSymbol(param, parts[3].to_owned()),
+            };
+            commands.push((id, value));
+        }
+        for (id, value) in commands {
+            self.context.graph[id].node.send_msg(value);
+            if let Some(e) = self.context.graph[id].node.take_error() {
+                self.render_error = Some(e.clone());
+                return Err(EngineError::ProcessingError(e));
             }
         }
+        Ok(())
     }
 
     // for bela adc, in the utils.rs, the adc will become a pass node
@@ -145,6 +178,25 @@ impl<const N: usize> Engine<N> {
             .insert(name.to_owned(), (sample, channels, sr));
     }
 
+    /// Register a bank before loading patches that reference it. Existing voices keep their Arc.
+    pub fn add_wavetable(
+        &mut self,
+        name: &str,
+        bank: Arc<WavetableBank>,
+    ) -> Result<(), EngineError> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(EngineError::InvalidParameter(
+                "invalid wavetable bank name".into(),
+            ));
+        }
+        self.wave_tables.insert(name.to_owned(), bank);
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.context.reset();
         self.ast = None;
@@ -158,6 +210,10 @@ impl<const N: usize> Engine<N> {
         self.clock = 0;
         self.livecoding = true;
         self.need_update = false;
+        self.render_error = None;
+        self.index_info
+            .insert("~input".into(), vec![self.context.add_stereo_node(Pass {})]);
+        self.index_info_backup.clone_from(&self.index_info);
     }
 
     // This is kind of a mess. But the basic idea is that we want to:
@@ -170,6 +226,12 @@ impl<const N: usize> Engine<N> {
     //       update it fully to reflect the new syntax
     // 4. Set self.ast = new_ast;
     pub fn update_with_code(&mut self, code: &str) -> Result<(), EngineError> {
+        let result = self.update_with_code_inner(code);
+        self.render_error = result.as_ref().err().map(ToString::to_string);
+        result
+    }
+
+    fn update_with_code_inner(&mut self, code: &str) -> Result<(), EngineError> {
         // It would be nice to re-use the allocation in self.ast for this Yoke creation, but I
         // can't figure out a way to.
         // We have to make this Yoke here to return it (we can't like make an `Ast` with the same
@@ -180,6 +242,70 @@ impl<const N: usize> Engine<N> {
         let new_ast: YokedAst =
             Yoke::try_attach_to_cart(code.to_owned().into_boxed_str(), |code| get_ast(code))?;
 
+        if self.sr == 0 || !self.bpm.is_finite() || self.bpm <= 0.0 {
+            return Err(EngineError::InvalidParameter(
+                "sample rate and BPM must be positive".into(),
+            ));
+        }
+        // Validate references before diffing so rejected code cannot mutate the live graph.
+        for chain in new_ast.get().nodes.values() {
+            for (position, component) in chain.iter().enumerate() {
+                if position == 0
+                    && matches!(
+                        component,
+                        Component::Mul(_)
+                            | Component::Add(_)
+                            | Component::Pan(_)
+                            | Component::Delayn(_)
+                            | Component::Delayms(_)
+                            | Component::Adsr(_)
+                            | Component::EnvPerc(_)
+                            | Component::Plate(_)
+                            | Component::Lpf(_)
+                            | Component::Rhpf(_)
+                            | Component::Onepole(_)
+                            | Component::ApfmsGain(_)
+                            | Component::Bd(_)
+                            | Component::Sn(_)
+                            | Component::Hh(_)
+                            | Component::SawSynth(_)
+                            | Component::SquSynth(_)
+                            | Component::TriSynth(_)
+                    )
+                {
+                    return Err(EngineError::InvalidParameter(
+                        "effect/envelope/instrument needs a preceding signal or trigger".into(),
+                    ));
+                }
+                if position > 0
+                    && matches!(
+                        component,
+                        Component::Pulse(_) | Component::Wavetable(_) | Component::Gate(_)
+                    )
+                {
+                    return Err(EngineError::InvalidParameter(
+                        "pulse, wavetable and gate are sources; place them at the start of a chain"
+                            .into(),
+                    ));
+                }
+                for name in component.all_references() {
+                    let exists = if let Some(prefix) = name.strip_suffix("..") {
+                        new_ast
+                            .get()
+                            .nodes
+                            .keys()
+                            .any(|key| key.starts_with(prefix))
+                    } else {
+                        new_ast.get().nodes.contains_key(name)
+                            || ((name == "~input" || name.starts_with("~adc"))
+                                && self.index_info.contains_key(name))
+                    };
+                    if !exists {
+                        return Err(EngineError::NonExistReference(name.to_owned()));
+                    }
+                }
+            }
+        }
         self.temp_node_index.clear();
 
         let mut graph_diff = GraphDiff::default();
@@ -192,12 +318,14 @@ impl<const N: usize> Engine<N> {
             iter: impl Iterator<Item = (usize, &'iter Component<'ast>)>,
             graph_diff: &mut GraphDiff<'ast, N>,
             samples_dict: &HashMap<String, (&'static [f32], usize, usize)>,
+            wave_tables: &HashMap<String, Arc<WavetableBank>>,
             sr: usize,
             bpm: f32,
             seed: usize,
         ) -> Result<(), EngineError> {
             for (i, component) in iter {
-                let (nodedata, reflist) = makenode(component, samples_dict, sr, bpm, seed)?;
+                let (nodedata, reflist) =
+                    makenode(component, samples_dict, wave_tables, sr, bpm, seed)?;
 
                 if !reflist.is_empty() {
                     graph_diff.refpairlist.push((reflist, chain_name, i));
@@ -220,6 +348,7 @@ impl<const N: usize> Engine<N> {
                         new_chain.iter().enumerate(),
                         &mut graph_diff,
                         &self.samples_dict,
+                        &self.wave_tables,
                         self.sr,
                         self.bpm,
                         self.seed,
@@ -268,6 +397,7 @@ impl<const N: usize> Engine<N> {
                         .filter(|(_, comp)| !old_chain.iter().any(|old_comp| old_comp == *comp)),
                     &mut graph_diff,
                     &self.samples_dict,
+                    &self.wave_tables,
                     self.sr,
                     self.bpm,
                     self.seed,
@@ -304,6 +434,7 @@ impl<const N: usize> Engine<N> {
                     new_chain.iter().enumerate(),
                     &mut graph_diff,
                     &self.samples_dict,
+                    &self.wave_tables,
                     self.sr,
                     self.bpm,
                     self.seed,
@@ -565,6 +696,45 @@ impl<const N: usize> Engine<N> {
         e
     }
 
+    /// Render a block for offline/dataset use; never accept stale audio after an error.
+    /// A failed engine must be reset or receive a successful patch update before reuse.
+    pub fn try_next_block(&mut self, buf: Vec<&[f32]>) -> Result<&[Buffer<N>], EngineError> {
+        if let Some(e) = &self.render_error {
+            return Err(EngineError::ProcessingError(e.clone()));
+        }
+        if N == 0 || self.sr == 0 || !self.bpm.is_finite() || self.bpm <= 0.0 {
+            return Err(EngineError::InvalidParameter(
+                "block size, sample rate and BPM must be positive".into(),
+            ));
+        }
+        if buf.len() > 2
+            || buf
+                .iter()
+                .any(|b| b.len() != N || b.iter().any(|s| !s.is_finite()))
+        {
+            return Err(EngineError::InvalidParameter(
+                "input must contain up to two finite blocks of N samples".into(),
+            ));
+        }
+        self.next_block(buf);
+        for node in self.context.graph.node_weights_mut() {
+            if let Some(e) = node.node.take_error() {
+                self.render_error = Some(e.clone());
+                return Err(EngineError::ProcessingError(e));
+            }
+            if node
+                .buffers
+                .iter()
+                .any(|b| b.iter().any(|x| !x.is_finite()))
+            {
+                let e = "node produced nonfinite samples".to_owned();
+                self.render_error = Some(e.clone());
+                return Err(EngineError::ProcessingError(e));
+            }
+        }
+        Ok(&self.context.graph[self.context.destination].buffers)
+    }
+
     pub fn next_block(&mut self, buf: Vec<&[f32]>) -> &[Buffer<N>] {
         //  -> &Vec<Buffer<N>>
         if !buf.is_empty() {
@@ -589,8 +759,21 @@ impl<const N: usize> Engine<N> {
         self.bpm = bpm;
         self.context.send_msg_to_all(Message::SetBPM(bpm));
     }
+    /// Set before constructing a patch. Reset before changing an existing patch's rate.
     pub fn set_sr(&mut self, sr: usize) {
-        self.sr = sr
+        if let Err(e) = self.try_set_sr(sr) {
+            self.render_error = Some(e.to_string());
+        }
+    }
+    pub fn try_set_sr(&mut self, sr: usize) -> Result<(), EngineError> {
+        if sr == 0 || (self.ast.is_some() && sr != self.sr) {
+            return Err(EngineError::InvalidParameter(
+                "set a positive sample rate before loading a patch; reset before changing it"
+                    .into(),
+            ));
+        }
+        self.sr = sr;
+        Ok(())
     }
     pub fn set_seed(&mut self, seed: usize) {
         self.seed = seed

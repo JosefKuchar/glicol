@@ -34,6 +34,7 @@ impl AllPassFilterGain {
         } else {
             delay / 1000. * self.sr as f32
         } as usize;
+        let size = size.max(1);
         Self {
             bufx: ring_buffer::Fixed::from(vec![0.0; size]),
             bufy: ring_buffer::Fixed::from(vec![0.0; size]),
@@ -75,17 +76,21 @@ impl<const N: usize> Node<N> for AllPassFilterGain {
                     .zip(main_input.buffers()[0].iter())
                     .zip(ref_input.buffers()[0].iter())
                 {
-                    let mut pos = -mod_buf / 1000. * self.sr as f32;
-                    while pos < 0. {
-                        pos += self.bufx.len() as f32;
-                    }
+                    let delay = if mod_buf.is_finite() {
+                        mod_buf.clamp(
+                            1000.0 / self.sr.max(1) as f32,
+                            self.bufx.len() as f32 * 1000.0 / self.sr.max(1) as f32,
+                        )
+                    } else {
+                        1.0
+                    };
+                    let pos = (-delay / 1000. * self.sr as f32).rem_euclid(self.bufx.len() as f32);
                     let pos_int = pos.floor() as usize;
                     let pos_frac = pos.fract();
-
-                    let xdelay = self.bufx.get(pos_int) * pos_frac
-                        + self.bufx.get(pos_int + 1) * (1. - pos_frac);
-                    let ydelay = self.bufy.get(pos_int) * pos_frac
-                        + self.bufy.get(pos_int + 1) * (1. - pos_frac);
+                    let xdelay = self.bufx.get(pos_int) * (1. - pos_frac)
+                        + self.bufx.get((pos_int + 1) % self.bufx.len()) * pos_frac;
+                    let ydelay = self.bufy.get(pos_int) * (1. - pos_frac)
+                        + self.bufy.get((pos_int + 1) % self.bufy.len()) * pos_frac;
 
                     let yn = -self.gain * xn + xdelay + self.gain * ydelay;
 
@@ -103,8 +108,8 @@ impl<const N: usize> Node<N> for AllPassFilterGain {
             Message::SetToNumber(pos, value) => match pos {
                 0 => {
                     let delay_n = (value / 1000. * self.sr as f32) as usize;
-                    self.bufx.set_first(delay_n);
-                    self.bufy.set_first(delay_n);
+                    self.bufx = Fixed::from(vec![0.0; delay_n.max(1)]);
+                    self.bufy = Fixed::from(vec![0.0; delay_n.max(1)]);
                 }
                 1 => self.gain = value,
                 _ => {}

@@ -45,16 +45,12 @@ impl<const N: usize> Node<N> for SquOsc {
             self.freq,
             &mut self.inc,
             |out, freq| {
-                if self.phase <= 0.5 {
-                    *out = 1.0;
-                } else {
-                    *out = -1.0;
-                }
-
-                self.phase += freq / self.sr as f32;
-                if self.phase > 1. {
-                    self.phase -= 1.
-                }
+                let step = super::phase_step(freq, self.sr);
+                self.phase = self.phase.rem_euclid(1.0);
+                *out = if self.phase < 0.5 { 1.0 } else { -1.0 };
+                *out += super::poly_blep(self.phase, step.abs())
+                    - super::poly_blep((self.phase + 0.5).rem_euclid(1.0), step.abs());
+                self.phase = (self.phase + step).rem_euclid(1.0);
             },
         );
     }

@@ -11,6 +11,11 @@ use glicol_synth::{
     synth::{MsgSynth, PatternSynth},
     Node, Pass, Sum2,
 };
+use glicol_synth::{
+    oscillator::{PulseOsc, WavetableBank, WavetableOsc},
+    signal::Gate,
+};
+use std::sync::Arc;
 
 use glicol_parser::{
     nodes::{self, Component, UsizeOrRef},
@@ -35,17 +40,59 @@ pub type GlicolNodeData<const N: usize> = NodeData<BoxedNodeSend<N>, N>;
 pub fn makenode<const N: usize>(
     component: &Component<'_>,
     samples_dict: &HashMap<String, (&'static [f32], usize, usize)>,
+    wave_tables: &HashMap<String, Arc<WavetableBank>>,
     sr: usize,
     bpm: f32,
     seed: usize,
 ) -> Result<(GlicolNodeData<N>, Vec<String>), EngineError> {
+    validate_component(component, sr, bpm)?;
     let (nodedata, reflist) = match component {
+        Component::Gate(nodes::Gate { onset, duration }) => (
+            Gate::new(
+                (*onset as f64 * sr as f64).round() as usize,
+                (*duration as f64 * sr as f64).round() as usize,
+            )
+            .to_boxed_nodedata(1),
+            vec![],
+        ),
+        Component::Pulse(nodes::Pulse { frequency, width }) => {
+            let mut refs = vec![];
+            let (frequency, freq_ref) = control_param(frequency, &mut refs);
+            let (width, width_ref) = control_param(width, &mut refs);
+            (
+                PulseOsc::new(frequency, width, sr)
+                    .controls(freq_ref, width_ref)
+                    .to_boxed_nodedata(1),
+                refs,
+            )
+        }
+        Component::Wavetable(nodes::Wavetable {
+            bank,
+            frequency,
+            position,
+        }) => {
+            let name = bank.trim_matches(['\\', '\'']);
+            let bank = wave_tables.get(name).ok_or_else(|| {
+                EngineError::InvalidParameter(format!("unknown wavetable bank {name}"))
+            })?;
+            let mut refs = vec![];
+            let (frequency, freq_ref) = control_param(frequency, &mut refs);
+            let (position, position_ref) = control_param(position, &mut refs);
+            (
+                WavetableOsc::new(bank.clone(), frequency, position, sr)
+                    .controls(freq_ref, position_ref)
+                    .to_boxed_nodedata(1),
+                refs,
+            )
+        }
         #[cfg(feature = "use-samples")]
         Component::PSampler(psampler) => {
             let mut samples_dict_selected = HashMap::new();
             let (pattern, span) = match psampler {
-                nodes::PSampler::Event(_) => panic!("An event inside PSampler is not yet supported; please file an issue if you encounter this"),
-                nodes::PSampler::Pattern(ref pat) => (&pat.event, pat.span)
+                nodes::PSampler::Event(_) => {
+                    return Err(EngineError::UnsupportedNode("psampler event".into()))
+                }
+                nodes::PSampler::Pattern(ref pat) => (&pat.event, pat.span),
             };
 
             let pattern = pattern
@@ -104,14 +151,19 @@ pub fn makenode<const N: usize>(
             let events = pattern
                 .split(',')
                 .map(|event| {
-                    let mut result = event
-                        .split(' ')
-                        .filter(|x| !x.is_empty())
-                        .map(|x| x.replace(' ', "").parse::<f32>().unwrap());
-
-                    (result.next().unwrap(), result.next().unwrap())
+                    let values = event
+                        .split_whitespace()
+                        .map(str::parse::<f32>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| EngineError::InvalidParameter(e.to_string()))?;
+                    if values.len() != 2 || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+                        return Err(EngineError::InvalidParameter(
+                            "psynth expects time pitch pairs".into(),
+                        ));
+                    }
+                    Ok((values[0], values[1]))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, EngineError>>()?;
 
             (
                 PatternSynth::new(events).sr(sr).to_boxed_nodedata(1),
@@ -136,7 +188,11 @@ pub fn makenode<const N: usize>(
 
         #[cfg(feature = "use-meta")]
         Component::Meta(nodes::Meta { code }) => (
-            Meta::new().sr(sr).code(code.code).to_boxed_nodedata(1),
+            Meta::new()
+                .sr(sr)
+                .try_code(code.code)
+                .map_err(EngineError::InvalidParameter)?
+                .to_boxed_nodedata(1),
             vec![],
         ),
         // "expr" => {
@@ -148,7 +204,11 @@ pub fn makenode<const N: usize>(
         //     }
         // },
         Component::Eval(nodes::Eval { code }) => (
-            Eval::new().sr(sr).code(code.code).to_boxed_nodedata(1),
+            Eval::new()
+                .sr(sr)
+                .try_code(code.code)
+                .map_err(EngineError::InvalidParameter)?
+                .to_boxed_nodedata(1),
             vec![],
         ),
         Component::Lpf(nodes::Lpf { signal, qvalue }) => {
@@ -294,7 +354,10 @@ pub fn makenode<const N: usize>(
                 vec![s.to_string()],
             ),
         },
-        Component::Plate(nodes::Plate { mix }) => (Plate::new(*mix).to_boxed_nodedata(2), vec![]),
+        Component::Plate(nodes::Plate { mix }) => (
+            Plate::with_sample_rate(*mix, sr).to_boxed_nodedata(2),
+            vec![],
+        ),
         Component::Imp(nodes::Imp { param }) => match param {
             nodes::NumberOrRef::Number(v) => {
                 (Impulse::new().sr(sr).freq(*v).to_boxed_nodedata(1), vec![])
@@ -338,18 +401,39 @@ pub fn makenode<const N: usize>(
             (ConstSig::new(*value).sr(sr).to_boxed_nodedata(1), vec![])
         }
         // todo: give sr to them
-        Component::Bd(nodes::Bd { param }) => get_one_para_from_number_or_ref::<N, Bd<N>>(param, 2),
-        Component::Hh(nodes::Hh { param }) => get_one_para_from_number_or_ref::<N, Hh<N>>(param, 2),
-        Component::Sn(nodes::Sn { param }) => get_one_para_from_number_or_ref::<N, Sn<N>>(param, 2),
-        Component::SawSynth(nodes::SawSynth { attack, decay }) => {
-            (SawSynth::new(*attack, *decay).to_boxed_nodedata(2), vec![])
+        Component::Bd(nodes::Bd { param }) => {
+            let (value, refs) = match param {
+                nodes::NumberOrRef::Number(v) => (*v, vec![]),
+                nodes::NumberOrRef::Ref(r) => (0.1, vec![r.to_string()]),
+            };
+            (Bd::with_sample_rate(value, sr).to_boxed_nodedata(2), refs)
         }
-        Component::SquSynth(nodes::SquSynth { attack, decay }) => {
-            (SquSynth::new(*attack, *decay).to_boxed_nodedata(2), vec![])
+        Component::Hh(nodes::Hh { param }) => {
+            let (value, refs) = match param {
+                nodes::NumberOrRef::Number(v) => (*v, vec![]),
+                nodes::NumberOrRef::Ref(r) => (0.1, vec![r.to_string()]),
+            };
+            (Hh::with_sample_rate(value, sr).to_boxed_nodedata(2), refs)
         }
-        Component::TriSynth(nodes::TriSynth { attack, decay }) => {
-            (TriSynth::new(*attack, *decay).to_boxed_nodedata(2), vec![])
+        Component::Sn(nodes::Sn { param }) => {
+            let (value, refs) = match param {
+                nodes::NumberOrRef::Number(v) => (*v, vec![]),
+                nodes::NumberOrRef::Ref(r) => (0.1, vec![r.to_string()]),
+            };
+            (Sn::with_sample_rate(value, sr).to_boxed_nodedata(2), refs)
         }
+        Component::SawSynth(nodes::SawSynth { attack, decay }) => (
+            SawSynth::with_sample_rate(*attack, *decay, sr).to_boxed_nodedata(2),
+            vec![],
+        ),
+        Component::SquSynth(nodes::SquSynth { attack, decay }) => (
+            SquSynth::with_sample_rate(*attack, *decay, sr).to_boxed_nodedata(2),
+            vec![],
+        ),
+        Component::TriSynth(nodes::TriSynth { attack, decay }) => (
+            TriSynth::with_sample_rate(*attack, *decay, sr).to_boxed_nodedata(2),
+            vec![],
+        ),
         Component::Get(nodes::Get { reference }) => (
             NodeData::new2(BoxedNodeSend::new(Pass {})),
             vec![reference.to_string()],
@@ -403,25 +487,22 @@ pub fn makenode<const N: usize>(
             )
         }
         Component::Reverb(_) | Component::Expr(_) => {
-            panic!("{component:?} is currently not supported within the engine")
+            return Err(EngineError::UnsupportedNode(format!("{component:?}")))
         }
         #[cfg(not(feature = "use-samples"))]
         Component::Sp(_) | Component::PSampler(_) => {
-            panic!("The `use-samples` feature is required to use the `sp` or `psampler` node")
+            return Err(EngineError::UnsupportedNode(
+                "sampler requires use-samples".into(),
+            ))
         }
         #[cfg(not(feature = "bela"))]
-        Component::Adc(_) => panic!("The `bela` feature is required to use the `adc` node"),
+        Component::Adc(_) => return Err(EngineError::UnsupportedNode("adc requires bela".into())),
         #[cfg(not(feature = "use-meta"))]
-        Component::Meta(_) => panic!("The `use-meta` feature is required to use the `meta` node"),
-        // "sendpass" => {
-        //     let reflist = match &paras[0] {
-        //         GlicolPara::RefList(v) => {
-        //             v
-        //         },
-        //         _ => unimplemented!()
-        //     };
-        //     ( Pass{}.to_boxed_nodedata(2), reflist)
-        // },
+        Component::Meta(_) => {
+            return Err(EngineError::UnsupportedNode(
+                "meta requires use-meta".into(),
+            ))
+        }
     };
     Ok((nodedata, reflist))
 }
@@ -440,4 +521,131 @@ where
             vec![(*s).to_owned()],
         ),
     }
+}
+
+fn control_param(param: &nodes::NumberOrRef<&str>, refs: &mut Vec<String>) -> (f32, Option<usize>) {
+    match param {
+        nodes::NumberOrRef::Number(v) => (*v, None),
+        nodes::NumberOrRef::Ref(r) => {
+            let slot = refs.len();
+            refs.push(r.to_string());
+            (0., Some(slot))
+        }
+    }
+}
+
+fn validate_component(c: &Component<'_>, sr: usize, bpm: f32) -> Result<(), EngineError> {
+    let check = |v: f32, min: f32, max: f32, name: &str| {
+        if v.is_finite() && v >= min && v <= max {
+            Ok(())
+        } else {
+            Err(EngineError::InvalidParameter(format!(
+                "{name} must be finite and in {min}..={max}"
+            )))
+        }
+    };
+    let signal = |p: &nodes::NumberOrRef<&str>, min, max, name| match p {
+        nodes::NumberOrRef::Number(v) => check(*v, min, max, name),
+        _ => Ok(()),
+    };
+    match c {
+        Component::Gate(nodes::Gate { onset, duration }) => {
+            check(*onset, 0., 86400., "gate onset")?;
+            check(*duration, 0., 86400., "gate duration")?;
+        }
+        Component::Adsr(nodes::Adsr {
+            attack,
+            decay,
+            sustain,
+            release,
+        }) => {
+            for v in [attack, decay, release] {
+                check(*v, 0., 600., "envelope time")?;
+            }
+            check(*sustain, 0., 1., "sustain")?;
+        }
+        Component::EnvPerc(nodes::EnvPerc { attack, decay }) => {
+            check(*attack, 0., 600., "attack")?;
+            check(*decay, 0., 600., "decay")?;
+        }
+        Component::SawSynth(nodes::SawSynth { attack, decay })
+        | Component::SquSynth(nodes::SquSynth { attack, decay })
+        | Component::TriSynth(nodes::TriSynth { attack, decay }) => {
+            check(*attack, 0., 600., "attack")?;
+            check(*decay, 0., 600., "decay")?;
+        }
+        Component::Bd(nodes::Bd { param })
+        | Component::Sn(nodes::Sn { param })
+        | Component::Hh(nodes::Hh { param }) => signal(param, 0., 600., "decay")?,
+        Component::Pulse(nodes::Pulse { frequency, width }) => {
+            signal(
+                frequency,
+                -(sr as f32) * 0.499,
+                sr as f32 * 0.499,
+                "frequency",
+            )?;
+            signal(width, 0.001, 0.999, "pulse width")?;
+        }
+        Component::Wavetable(nodes::Wavetable {
+            frequency,
+            position,
+            ..
+        }) => {
+            signal(
+                frequency,
+                -(sr as f32) * 0.499,
+                sr as f32 * 0.499,
+                "frequency",
+            )?;
+            signal(position, 0., 1., "wavetable position")?;
+        }
+        Component::Points(nodes::Points {
+            points,
+            span,
+            is_looping,
+        }) => {
+            check(*span, f32::MIN_POSITIVE, 86400., "curve span")?;
+            if points.is_empty() {
+                return Err(EngineError::InvalidParameter("empty curve".into()));
+            }
+            let mut last = -1.;
+            for (time, value) in points {
+                check(time.bar, 0., 86400., "curve bar")?;
+                check(*value, -1e6, 1e6, "curve value")?;
+                let offset = match time.time {
+                    Some(nodes::Duration::Seconds(s)) => s,
+                    Some(nodes::Duration::Milliseconds(ms)) => ms / 1000.,
+                    Some(nodes::Duration::Bar(b)) => b * 240. / bpm * span,
+                    None => 0.,
+                };
+                let seconds = time.bar * 240.0 / bpm * span + offset;
+                check(seconds, 0., 86400., "curve timestamp")?;
+                if seconds < last {
+                    return Err(EngineError::InvalidParameter(
+                        "curve timestamps must be ordered".into(),
+                    ));
+                }
+                if *is_looping && seconds > 240.0 / bpm * span {
+                    return Err(EngineError::InvalidParameter(
+                        "loop curve timestamp exceeds its period".into(),
+                    ));
+                }
+                last = seconds;
+            }
+        }
+        Component::Plate(nodes::Plate { mix }) => check(*mix, 0., 1., "plate mix")?,
+        Component::Rhpf(nodes::Rhpf { qvalue, .. }) | Component::Lpf(nodes::Lpf { qvalue, .. }) => {
+            check(*qvalue, 0.01, 100., "filter Q")?
+        }
+        Component::Delayms(nodes::Delayms { param }) => {
+            signal(param, 0., 10000., "delay milliseconds")?
+        }
+        Component::Pan(nodes::Pan { param }) => signal(param, -1., 1., "pan")?,
+        Component::ConstSig(nodes::ConstSig { value }) => check(*value, -1e12, 1e12, "signal")?,
+        Component::Imp(nodes::Imp { param }) => {
+            signal(param, f32::MIN_POSITIVE, sr as f32, "impulse frequency")?
+        }
+        _ => {}
+    }
+    Ok(())
 }

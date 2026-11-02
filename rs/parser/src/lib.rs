@@ -52,6 +52,9 @@ pub fn get_ast(code: &str) -> Result<nodes::Ast<'_>, Box<Error<Rule>>> {
                     .ok_or_else(|| node_end.to_err_with_positives([Rule::node]))?;
 
                 let component = match_or_return_err!(node,
+                    Rule::pulse => { Component::Pulse(nodes::Pulse::parse(node)?) },
+                    Rule::wavetable => { Component::Wavetable(nodes::Wavetable::parse(node)?) },
+                    Rule::gate => { Component::Gate(nodes::Gate::parse(node)?) },
                     Rule::points => { Component::Points(Points::parse(node)?) },
                     Rule::delayn => { Component::Delayn(nodes::Delayn::parse(node)?) },
                     Rule::delayms => { Component::Delayms(nodes::Delayms::parse(node)?) },

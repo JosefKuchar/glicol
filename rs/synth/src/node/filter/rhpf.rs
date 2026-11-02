@@ -4,7 +4,6 @@ use hashbrown::HashMap;
 pub struct ResonantHighPassFilter {
     cutoff: f32,
     q: f32,
-    x0: f32,
     x1: f32,
     x2: f32,
     y1: f32,
@@ -24,7 +23,6 @@ impl ResonantHighPassFilter {
         Self {
             cutoff: 20.,
             q: 1.0,
-            x0: 0.,
             x1: 0.,
             x2: 0.,
             y1: 0.,
@@ -48,55 +46,46 @@ impl ResonantHighPassFilter {
 
 impl<const N: usize> Node<N> for ResonantHighPassFilter {
     fn process(&mut self, inputs: &mut HashMap<usize, Input<N>>, output: &mut [Buffer<N>]) {
-        // println!("\n\ninputs[1] \n\n {:?}\n\n", inputs[1].buffers());
-        match inputs.len() {
-            1 => {
-                let main_input = inputs.values_mut().next().unwrap();
-                let theta_c = 2.0 * std::f32::consts::PI * self.cutoff / self.sr as f32;
-                let d = 1.0 / self.q;
-                let beta = 0.5 * (1.0 - d * theta_c.sin() / 2.0) / (1.0 + d * theta_c.sin() / 2.0);
-                let gama = (0.5 + beta) * theta_c.cos();
-                let a0 = (0.5 + beta + gama) / 2.0;
-                let a1 = -0.5 - beta - gama;
-                let a2 = (0.5 + beta + gama) / 2.0;
-                let b1 = -2.0 * gama;
-                let b2 = 2.0 * beta;
-                for (out, x0) in output[0].iter_mut().zip(main_input.buffers()[0].iter()) {
-                    let y =
-                        a0 * self.x0 + a1 * self.x1 + a2 * self.x2 - b1 * self.y1 - b2 * self.y2;
-                    *out = y;
-                    self.x2 = self.x1;
-                    self.x1 = *x0;
-                    self.y2 = self.y1;
-                    self.y1 = y;
-                }
+        if inputs.is_empty() {
+            return;
+        }
+        let main = inputs
+            .get(self.input_order.first().unwrap_or(&usize::MAX))
+            .or_else(|| inputs.values().next())
+            .unwrap()
+            .buffers();
+        let control = self
+            .input_order
+            .get(1)
+            .and_then(|id| inputs.get(id))
+            .map(|i| i.buffers());
+        for i in 0..N {
+            let cutoff = control.map_or(self.cutoff, |b| b[0][i]);
+            let cutoff = if cutoff.is_finite() {
+                cutoff.clamp(0.0, self.sr as f32 * 0.499)
+            } else {
+                0.0
+            };
+            let q = if self.q.is_finite() {
+                self.q.clamp(0.01, 100.0)
+            } else {
+                1.0
+            };
+            let theta = 2.0 * std::f32::consts::PI * cutoff / self.sr.max(1) as f32;
+            let beta = 0.5 * (1.0 - theta.sin() / (2.0 * q)) / (1.0 + theta.sin() / (2.0 * q));
+            let gamma = (0.5 + beta) * theta.cos();
+            let a0 = (0.5 + beta + gamma) / 2.0;
+            let a1 = -2.0 * a0;
+            let x = main[0][i];
+            let y =
+                a0 * x + a1 * self.x1 + a0 * self.x2 + 2.0 * gamma * self.y1 - 2.0 * beta * self.y2;
+            self.x2 = self.x1;
+            self.x1 = x;
+            self.y2 = self.y1;
+            self.y1 = y;
+            for channel in output.iter_mut() {
+                channel[i] = y;
             }
-            2 => {
-                let main_input = &inputs[&self.input_order[0]]; // can panic if there is no id
-                let ref_input = &inputs[&self.input_order[1]]; // can panic if there is no id
-
-                let theta_c =
-                    2.0 * std::f32::consts::PI * ref_input.buffers()[0][0] / self.sr as f32;
-                let d = 1.0 / self.q;
-                let beta = 0.5 * (1.0 - d * theta_c.sin() / 2.0) / (1.0 + d * theta_c.sin() / 2.0);
-                let gama = (0.5 + beta) * theta_c.cos();
-                let a0 = (0.5 + beta + gama) / 2.0;
-                let a1 = -0.5 - beta - gama;
-                let a2 = (0.5 + beta + gama) / 2.0;
-                let b1 = -2.0 * gama;
-                let b2 = 2.0 * beta;
-
-                for (out, x0) in output[0].iter_mut().zip(main_input.buffers()[0].iter()) {
-                    let y =
-                        a0 * self.x0 + a1 * self.x1 + a2 * self.x2 - b1 * self.y1 - b2 * self.y2;
-                    *out = y;
-                    self.x2 = self.x1;
-                    self.x1 = *x0;
-                    self.y2 = self.y1;
-                    self.y1 = y;
-                }
-            }
-            _ => (),
         }
     }
 

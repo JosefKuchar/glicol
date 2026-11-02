@@ -1,144 +1,153 @@
-use crate::{BoxedNodeSend, Buffer, Input, Message, Node, NodeData};
+use crate::{Buffer, Input, Message, Node};
+use fasteval::{Compiler, Evaler};
 use hashbrown::HashMap;
-// use evalexpr::*;
-use fasteval::Compiler;
-use fasteval::Evaler; // use this trait so we can call eval().
-use std::collections::BTreeMap; // use this trait so we can call compile().
-                                // use fasteval::eval_compiled;
+use std::collections::BTreeMap;
 
+/// Stateful per-sample expression processor. Use `try_code` for fallible construction.
 pub struct Eval<const N: usize> {
     pub sr: usize,
     pub bpm: f32,
     phase: usize,
-    // code: String,
-    // precompiled: evalexpr::Node,
-    var: Vec<String>,
     map: BTreeMap<String, f64>,
-    compiled: Vec<fasteval::Instruction>,
-    parser: fasteval::Parser,
-    slab: Vec<fasteval::Slab>,
+    compiled: Vec<(Option<String>, fasteval::Instruction, fasteval::Slab)>,
     input_order: Vec<usize>,
+    error: Option<String>,
 }
-
 impl<const N: usize> Default for Eval<N> {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl<const N: usize> Eval<N> {
     pub fn new() -> Self {
-        let parser = fasteval::Parser::new();
-        // let mut slab = fasteval::Slab::new();
-
-        let mut map: BTreeMap<String, f64> = BTreeMap::new();
-        map.insert("x".to_string(), 0.0);
-        map.insert("y".to_string(), 0.0);
-        map.insert("z".to_string(), 0.0);
-        map.insert("sr".to_string(), 44100.);
-
-        // let compiled = parser.parse("0.0", &mut slab.ps).unwrap().from(&slab.ps).compile(&slab.ps, &mut slab.cs);
-
         Self {
             sr: 44100,
             bpm: 120.,
             phase: 0,
-            map,
-            parser,
-            var: vec![],
-            slab: vec![],
+            map: BTreeMap::from_iter([
+                ("x".into(), 0.),
+                ("y".into(), 0.),
+                ("z".into(), 0.),
+                ("sr".into(), 44100.),
+                ("phase".into(), 0.),
+                ("in".into(), 0.),
+            ]),
             compiled: vec![],
-            input_order: Vec::new(),
+            input_order: vec![],
+            error: None,
         }
     }
-
     pub fn sr(mut self, sr: usize) -> Self {
-        self.map.insert("sr".to_string(), sr as f64);
-        // self.context.set_value("sr".to_owned(), Value::Int(sr as i64)).unwrap();
-        Self { sr, ..self }
+        self.sr = sr.max(1);
+        self.map.insert("sr".into(), self.sr as f64);
+        self
     }
-
-    pub fn bpm(self, bpm: f32) -> Self {
-        Self { bpm, ..self }
+    pub fn bpm(mut self, bpm: f32) -> Self {
+        self.bpm = bpm;
+        self
     }
-
+    pub fn try_code(mut self, code: &str) -> Result<Self, String> {
+        self.apply_code(code)?;
+        Ok(self)
+    }
     pub fn code(mut self, code: &str) -> Self {
-        self.apply_code(code);
-        Self { ..self }
+        if let Err(e) = self.apply_code(code) {
+            self.error = Some(e);
+        }
+        self
     }
-
-    fn apply_code(&mut self, code: &str) {
-        let lines = code.split(';');
-        for line in lines {
+    fn apply_code(&mut self, code: &str) -> Result<(), String> {
+        let parser = fasteval::Parser::new();
+        let mut compiled = Vec::new();
+        let mut namespace = self.map.clone();
+        for line in code.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (var, expr) = match line.split_once(":=") {
+                Some((var, expr)) => {
+                    let var = var.trim();
+                    if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return Err("invalid eval variable".into());
+                    }
+                    (Some(var.to_owned()), expr.trim())
+                }
+                None => (None, line),
+            };
             let mut slab = fasteval::Slab::new();
-            let mut assign = line.split(":=");
-            if line.contains(":=") {
-                self.var
-                    .push(assign.next().unwrap().replace([' ', '\t', '\n'], ""));
-            }
-            let compiled = self
-                .parser
-                .parse(assign.next().unwrap(), &mut slab.ps)
-                .unwrap()
+            let ins = parser
+                .parse(expr, &mut slab.ps)
+                .map_err(|e| e.to_string())?
                 .from(&slab.ps)
                 .compile(&slab.ps, &mut slab.cs);
-            self.slab.push(slab);
-            self.compiled.push(compiled);
+            // Resolve names and functions before installing a program. Stateful results are discarded.
+            let value = ins.eval(&slab, &mut namespace).map_err(|e| e.to_string())?;
+            if let Some(ref var) = var {
+                namespace.insert(var.clone(), value);
+            }
+            compiled.push((var, ins, slab));
         }
+        if compiled.is_empty() {
+            return Err("empty eval program".into());
+        }
+        self.compiled = compiled;
+        self.error = None;
+        Ok(())
     }
 }
-
 impl<const N: usize> Node<N> for Eval<N> {
     fn process(&mut self, inputs: &mut HashMap<usize, Input<N>>, output: &mut [Buffer<N>]) {
+        for out in output.iter_mut() {
+            out.fill(0.);
+        }
+        if self.error.is_some() {
+            return;
+        }
         for i in 0..N {
-            if !inputs.is_empty() {
-                self.map.insert(
-                    "in".to_owned(),
-                    inputs[&self.input_order[0]].buffers()[0][i] as f64,
-                );
+            if let Some(input) = self
+                .input_order
+                .first()
+                .and_then(|id| inputs.get(id))
+                .or_else(|| inputs.values().next())
+            {
+                self.map.insert("in".into(), input.buffers()[0][i] as f64);
             }
-            self.map.insert("phase".to_owned(), self.phase as f64);
-            // output[0][i] = self.compiled.eval(&self.slab, &mut self.map).unwrap() as f32;
-            // output[0][i] = fasteval::ez_eval(&self.code, &mut self.map).unwrap() as f32;
-
-            for (j, ins) in self.compiled.iter().enumerate() {
-                // println!("i is {}", j);
-                if j < self.compiled.len() - 1 {
-                    let v = ins.eval(&self.slab[j], &mut self.map).unwrap();
-                    self.map.insert(self.var[j].clone(), v);
-                } else {
-                    let v = ins.eval(&self.slab[j], &mut self.map).unwrap();
-                    output[0][i] = v as f32;
+            self.map.insert("phase".into(), self.phase as f64);
+            let mut value = 0.;
+            for (var, ins, slab) in &self.compiled {
+                value = match ins.eval(slab, &mut self.map) {
+                    Ok(v) if v.is_finite() && (v as f32).is_finite() => v,
+                    Ok(_) => {
+                        self.error = Some("eval produced a nonfinite sample".into());
+                        return;
+                    }
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        return;
+                    }
+                };
+                if let Some(var) = var {
+                    self.map.insert(var.clone(), value);
                 }
+            }
+            for out in output.iter_mut() {
+                out[i] = value as f32;
             }
             self.phase += 1;
         }
     }
-
     fn send_msg(&mut self, info: Message) {
         match info {
             Message::SetToSymbol(0, code) => {
-                self.slab.clear();
-                self.var.clear();
-                self.compiled.clear();
-                self.apply_code(&code);
-                // self.code(s);
-                // self.compiled = self.parser.parse(&s, &mut self.slab.ps).unwrap().from(&self.slab.ps)
-                // .compile(&self.slab.ps, &mut self.slab.cs);
-                // self.code = s
-                // self.precompiled = build_operator_tree(&s).unwrap()
+                if let Err(e) = self.apply_code(&code) {
+                    self.error = Some(e)
+                }
             }
             Message::Index(i) => self.input_order.push(i),
-            Message::IndexOrder(pos, index) => self.input_order.insert(pos, index),
-            Message::ResetOrder => {
-                self.input_order.clear();
-            }
+            Message::IndexOrder(p, i) => self.input_order.insert(p.min(self.input_order.len()), i),
+            Message::ResetOrder => self.input_order.clear(),
             _ => {}
         }
     }
-
-    fn to_boxed_nodedata(self, channels: usize) -> NodeData<BoxedNodeSend<N>, N> {
-        // self.scope.push("sr", self.sr as f32);
-        NodeData::multi_chan_node(channels, BoxedNodeSend::<N>::new(self))
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 }

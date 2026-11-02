@@ -94,6 +94,7 @@ fn write_err_to_buf(err: EngineError, result: &mut [u8]) {
         EngineError::ParsingError(_) => 1,
         EngineError::NonExistSample(_) => 2,
         EngineError::NonExistReference(_) => 3,
+        _ => 4,
     };
 
     let error = match err {
@@ -121,6 +122,7 @@ fn write_err_to_buf(err: EngineError, result: &mut [u8]) {
         }
         EngineError::NonExistSample(v) => format!("There is no sample named {v}"),
         EngineError::NonExistReference(v) => format!("There is no reference named {v}"),
+        other => other.to_string(),
     };
 
     let s = error.as_bytes();

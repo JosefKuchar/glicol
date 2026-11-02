@@ -6,3 +6,6 @@ mod noise;
 pub use noise::*;
 mod points;
 pub use points::*;
+
+mod gate;
+pub use gate::Gate;

@@ -50,6 +50,11 @@ pub trait Node<const N: usize> {
     fn process(&mut self, inputs: &mut HashMap<usize, Input<N>>, output: &mut [Buffer<N>]);
     fn send_msg(&mut self, info: crate::Message);
 
+    /// Retrieve a DSP/script error for checked hosts. Existing nodes need not implement this.
+    fn take_error(&mut self) -> Option<String> {
+        None
+    }
+
     fn to_boxed_nodedata(self, channels: usize) -> crate::NodeData<BoxedNodeSend<N>, N>
     where
         Self: Send + 'static + Sized,
@@ -107,6 +112,9 @@ where
     fn send_msg(&mut self, info: crate::Message) {
         (**self).send_msg(info)
     }
+    fn take_error(&mut self) -> Option<String> {
+        (**self).take_error()
+    }
 }
 
 impl<T, const N: usize> Node<N> for Box<T>
@@ -116,7 +124,12 @@ where
     fn process(&mut self, inputs: &mut HashMap<usize, Input<N>>, output: &mut [Buffer<N>]) {
         (**self).process(inputs, output)
     }
-    fn send_msg(&mut self, _info: crate::Message) {}
+    fn send_msg(&mut self, info: crate::Message) {
+        (**self).send_msg(info)
+    }
+    fn take_error(&mut self) -> Option<String> {
+        (**self).take_error()
+    }
 }
 
 impl<const N: usize> Node<N> for dyn Fn(&HashMap<usize, Input<N>>, &mut [Buffer<N>]) {

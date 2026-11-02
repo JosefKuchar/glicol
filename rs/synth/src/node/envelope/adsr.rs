@@ -73,12 +73,12 @@ impl<const N: usize> Node<N> for Adsr {
             let iter = buf[0].iter().zip(output[0].iter_mut());
 
             for (input, out) in iter {
-                if *input > 0.0 && self.lastx == 0.0 {
+                if *input > 0.0 && self.lastx <= 0.0 {
                     self.gate = 1.;
                     self.phase = 1; // attack, decay or sustain
                     self.pos = 0;
                     self.state_change_y = self.lasty;
-                } else if *input == 0.0 && self.lastx > 0.0 {
+                } else if *input <= 0.0 && self.lastx > 0.0 {
                     self.gate = 0.;
                     self.phase = 2; // release
                     self.pos = 0;
@@ -92,11 +92,12 @@ impl<const N: usize> Node<N> for Adsr {
                             // attack phase
                             if attack_len == 0 {
                                 // special case
-                                *out = 0.0;
+                                *out = 1.0;
                             } else {
                                 // attack from: lasty -> 1.0
-                                *out = self.pos as f32 / attack_len as f32
-                                    * (1.0 - self.state_change_y);
+                                *out = self.state_change_y
+                                    + self.pos as f32 / attack_len as f32
+                                        * (1.0 - self.state_change_y);
                             }
                         } else if self.pos > attack_len && self.pos <= attack_len + decay_len {
                             // decay phase
