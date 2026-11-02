@@ -106,6 +106,10 @@ cargo run --release -p glicol --example synthesis_offline -- /tmp/glicol-demo.wa
   computed at construction.
 - ADSR retriggering starts from the current output level. Zero-length stages have
   defined behavior. Per-voice independent gates avoid shared-envelope note-offs.
+- The current-input fix also addresses upstream [PR #196](https://github.com/chaosprint/glicol/pull/196)
+  and issue #195. Dedicated raw-node regressions cover DC rejection, a 65 Hz saw
+  through a 90 Hz high-pass, unity low-pass DC gain, and the first impulse sample
+  with both fixed and signal-driven cutoff.
 - LP/HP cutoff references update coefficients per sample. Filters use the current
   input sample, fixing a stale state variable. Q remains numeric, bounded to
   0.01..100; dynamic cutoff is clamped to 0..0.499 times sample rate. These remain

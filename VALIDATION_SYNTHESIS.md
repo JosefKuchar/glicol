@@ -5,9 +5,9 @@ Validation used Linux x86_64 and Rust 1.92.0. Implementation and scope are in
 [SYNTHESIS.md](SYNTHESIS.md); the new checks are in
 [rs/main/tests/dsp_regressions.rs](rs/main/tests/dsp_regressions.rs).
 
-- Native library/integration suite with `use-meta,use-samples`: **49 passed**,
-  including 30 new DSP regressions.
-- Default-feature native library/integration suite: **47 passed** (Rhai-specific
+- Native library/integration suite with `use-meta,use-samples`: **53 passed**,
+  including 30 synthesis regressions and four raw resonant-filter regressions.
+- Default-feature native library/integration suite: **51 passed** (Rhai-specific
   checks excluded).
 - All 30 DSP regressions also passed under `--release`.
 - `glicol-wasm` compiled for `wasm32-unknown-unknown` with its normal features.
@@ -45,3 +45,20 @@ These changes affect rendered sound and need a new engine/distribution version
 before training data is regenerated. Music-decompiler's Rustel renderer, Python
 binding, training setup and checkpoints have not been changed. Broad listening,
 throughput, Python worker and resampler qualification remain integration work.
+
+## PR #196 regression coverage
+
+[Upstream PR #196](https://github.com/chaosprint/glicol/pull/196) reports a missing
+current-input term in both resonant filters. The synthesis commit already
+removed the unused `x0` state and uses the current sample in the difference
+equation. No cherry-pick was needed on top of the per-sample modulation rewrite.
+
+The four [raw-node filter tests](rs/synth/tests/resonant_filters.rs) exercise
+fixed and signal-driven cutoff, including the reported 65 Hz saw / 90 Hz
+high-pass case, at 16, 44.1 and 48 kHz. They also check the first output sample
+of an impulse so future timing/gain regressions cannot hide behind a steady-state
+check. All four fail against the original upstream commit and pass in this fork.
+
+```sh
+cargo test --manifest-path rs/Cargo.toml -p glicol_synth --test resonant_filters
+```
